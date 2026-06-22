@@ -1,22 +1,40 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"log"
 	"net/http"
+	"os"
+	"strconv"
+	"strings"
 
+	"github.com/containerd/errdefs"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/client"
 )
 
-var dockerClient *client.Client
+var (
+	manager     ContainerManager
+	serverPort   = "8080"
+	stopTimeout  = 10
+)
+
+func init() {
+	if p := os.Getenv("PORT"); p != "" {
+		serverPort = p
+	}
+	if t := os.Getenv("STOP_TIMEOUT"); t != "" {
+		if val, err := strconv.Atoi(t); err == nil {
+			stopTimeout = val
+		}
+	}
+}
 
 func main() {
 	var err error
-	dockerClient, err = client.New(client.FromEnv, client.WithAPIVersionNegotiation())
+	manager, err = NewContainerManager()
 	if err != nil {
-		log.Fatalf("Failed to create docker client: %v", err)
+		log.Fatalf("Failed to create container manager: %v", err)
 	}
 
 	mux := http.NewServeMux()
@@ -32,8 +50,8 @@ func main() {
 	mux.HandleFunc("GET /containers/{id}/labels", handleContainerGetLabels)
 	mux.HandleFunc("PUT /containers/{id}/labels", handleContainerSetLabels)
 
-	log.Println("Container agent listening on :8080")
-	log.Fatal(http.ListenAndServe(":8080", mux))
+	log.Printf("Container agent listening on :%s\n", serverPort)
+	log.Fatal(http.ListenAndServe(":"+serverPort, mux))
 }
 
 type CreateRequest struct {
@@ -66,6 +84,14 @@ func writeJSON(w http.ResponseWriter, status int, resp APIResponse) {
 
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, APIResponse{OK: false, Message: msg})
+}
+
+func handleContainerError(w http.ResponseWriter, err error, msg string) {
+	if errdefs.IsNotFound(err) {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	writeError(w, http.StatusInternalServerError, msg+": "+err.Error())
 }
 
 func handleContainerCreate(w http.ResponseWriter, r *http.Request) {
@@ -101,15 +127,35 @@ func handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 		Name:       req.Name,
 	}
 
-	result, err := dockerClient.ContainerCreate(context.Background(), opts)
+	result, err := manager.ContainerCreate(r.Context(), opts)
+	if errdefs.IsNotFound(err) {
+		// Try pulling the image automatically
+		pullResp, pullErr := manager.ImagePull(r.Context(), req.Image, client.ImagePullOptions{})
+		if pullErr != nil {
+			writeError(w, http.StatusInternalServerError, "image pull failed: "+pullErr.Error())
+			return
+		}
+		if waitErr := pullResp.Wait(r.Context()); waitErr != nil {
+			writeError(w, http.StatusInternalServerError, "image pull wait failed: "+waitErr.Error())
+			return
+		}
+		// Retry create after pulling
+		result, err = manager.ContainerCreate(r.Context(), opts)
+	}
+
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "create failed: "+err.Error())
 		return
 	}
 
+	if _, err := manager.ContainerStart(r.Context(), result.ID, client.ContainerStartOptions{}); err != nil {
+		writeError(w, http.StatusInternalServerError, "start failed: "+err.Error())
+		return
+	}
+
 	writeJSON(w, http.StatusCreated, APIResponse{
 		OK:      true,
-		Message: "container created",
+		Message: "container created and started",
 		Data:    map[string]interface{}{"id": result.ID, "warnings": result.Warnings},
 	})
 }
@@ -117,7 +163,7 @@ func handleContainerCreate(w http.ResponseWriter, r *http.Request) {
 func handleContainerList(w http.ResponseWriter, r *http.Request) {
 	all := r.URL.Query().Get("all") == "true"
 
-	result, err := dockerClient.ContainerList(context.Background(), client.ContainerListOptions{All: all})
+	result, err := manager.ContainerList(r.Context(), client.ContainerListOptions{All: all})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "list failed: "+err.Error())
 		return
@@ -136,12 +182,14 @@ func handleContainerTeardown(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	timeout := 10
-	dockerClient.ContainerStop(context.Background(), id, client.ContainerStopOptions{Timeout: &timeout})
+	timeout := stopTimeout
+	if _, err := manager.ContainerStop(r.Context(), id, client.ContainerStopOptions{Timeout: &timeout}); err != nil {
+		handleContainerError(w, err, "stop failed")
+		return
+	}
 
-	_, err := dockerClient.ContainerRemove(context.Background(), id, client.ContainerRemoveOptions{Force: true})
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "remove failed: "+err.Error())
+	if _, err := manager.ContainerRemove(r.Context(), id, client.ContainerRemoveOptions{Force: true}); err != nil {
+		handleContainerError(w, err, "remove failed")
 		return
 	}
 
@@ -166,9 +214,15 @@ func handleContainerReplace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	timeout := 10
-	dockerClient.ContainerStop(context.Background(), id, client.ContainerStopOptions{Timeout: &timeout})
-	dockerClient.ContainerRemove(context.Background(), id, client.ContainerRemoveOptions{Force: true})
+	timeout := stopTimeout
+	if _, err := manager.ContainerStop(r.Context(), id, client.ContainerStopOptions{Timeout: &timeout}); err != nil {
+		writeError(w, http.StatusInternalServerError, "replace stop failed: "+err.Error())
+		return
+	}
+	if _, err := manager.ContainerRemove(r.Context(), id, client.ContainerRemoveOptions{Force: true}); err != nil {
+		writeError(w, http.StatusInternalServerError, "replace remove failed: "+err.Error())
+		return
+	}
 
 	cfg := req.Config
 	if cfg == nil {
@@ -191,15 +245,34 @@ func handleContainerReplace(w http.ResponseWriter, r *http.Request) {
 		Name:       req.Name,
 	}
 
-	result, err := dockerClient.ContainerCreate(context.Background(), opts)
+	result, err := manager.ContainerCreate(r.Context(), opts)
+	if errdefs.IsNotFound(err) {
+		pullResp, pullErr := manager.ImagePull(r.Context(), req.Image, client.ImagePullOptions{})
+		if pullErr != nil {
+			writeError(w, http.StatusInternalServerError, "replace image pull failed: "+pullErr.Error())
+			return
+		}
+		if waitErr := pullResp.Wait(r.Context()); waitErr != nil {
+			writeError(w, http.StatusInternalServerError, "replace image pull wait failed: "+waitErr.Error())
+			return
+		}
+		result, err = manager.ContainerCreate(r.Context(), opts)
+	}
+
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "replace create failed: "+err.Error())
 		return
 	}
 
+	if _, err := manager.ContainerStart(r.Context(), result.ID, client.ContainerStartOptions{}); err != nil {
+		writeError(w, http.StatusInternalServerError, "start failed: "+err.Error())
+		return
+	}
+
+
 	writeJSON(w, http.StatusCreated, APIResponse{
 		OK:      true,
-		Message: "container replaced",
+		Message: "container replaced and started",
 		Data:    map[string]interface{}{"id": result.ID, "warnings": result.Warnings},
 	})
 }
@@ -211,9 +284,8 @@ func handleContainerStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err := dockerClient.ContainerStart(context.Background(), id, client.ContainerStartOptions{})
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "start failed: "+err.Error())
+	if _, err := manager.ContainerStart(r.Context(), id, client.ContainerStartOptions{}); err != nil {
+		handleContainerError(w, err, "start failed")
 		return
 	}
 
@@ -227,10 +299,9 @@ func handleContainerStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	timeout := 10
-	_, err := dockerClient.ContainerStop(context.Background(), id, client.ContainerStopOptions{Timeout: &timeout})
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "stop failed: "+err.Error())
+	timeout := stopTimeout
+	if _, err := manager.ContainerStop(r.Context(), id, client.ContainerStopOptions{Timeout: &timeout}); err != nil {
+		handleContainerError(w, err, "stop failed")
 		return
 	}
 
@@ -244,10 +315,9 @@ func handleContainerRestart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	timeout := 10
-	_, err := dockerClient.ContainerRestart(context.Background(), id, client.ContainerRestartOptions{Timeout: &timeout})
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "restart failed: "+err.Error())
+	timeout := stopTimeout
+	if _, err := manager.ContainerRestart(r.Context(), id, client.ContainerRestartOptions{Timeout: &timeout}); err != nil {
+		handleContainerError(w, err, "restart failed")
 		return
 	}
 
@@ -261,9 +331,9 @@ func handleContainerInspect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := dockerClient.ContainerInspect(context.Background(), id, client.ContainerInspectOptions{})
+	result, err := manager.ContainerInspect(r.Context(), id, client.ContainerInspectOptions{})
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "inspect failed: "+err.Error())
+		handleContainerError(w, err, "inspect failed")
 		return
 	}
 
@@ -291,9 +361,8 @@ func handleContainerRename(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err := dockerClient.ContainerRename(context.Background(), id, client.ContainerRenameOptions{NewName: req.NewName})
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "rename failed: "+err.Error())
+	if _, err := manager.ContainerRename(r.Context(), id, client.ContainerRenameOptions{NewName: req.NewName}); err != nil {
+		handleContainerError(w, err, "rename failed")
 		return
 	}
 
@@ -307,9 +376,9 @@ func handleContainerGetLabels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := dockerClient.ContainerInspect(context.Background(), id, client.ContainerInspectOptions{})
+	result, err := manager.ContainerInspect(r.Context(), id, client.ContainerInspectOptions{})
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "inspect failed: "+err.Error())
+		handleContainerError(w, err, "inspect failed")
 		return
 	}
 
@@ -336,25 +405,62 @@ func handleContainerSetLabels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := dockerClient.ContainerInspect(context.Background(), id, client.ContainerInspectOptions{})
+	result, err := manager.ContainerInspect(r.Context(), id, client.ContainerInspectOptions{})
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "inspect failed: "+err.Error())
+		handleContainerError(w, err, "inspect failed")
 		return
 	}
 
-	existing := result.Container.Config.Labels
+	cfg := result.Container.Config
+	if cfg == nil {
+		cfg = &container.Config{}
+	}
+
+	existing := cfg.Labels
 	if existing == nil {
 		existing = make(map[string]string)
 	}
 	for k, v := range req.Labels {
 		existing[k] = v
 	}
+	cfg.Labels = existing
 
-	result.Container.Config.Labels = existing
+	timeout := stopTimeout
+	if _, err := manager.ContainerStop(r.Context(), id, client.ContainerStopOptions{Timeout: &timeout}); err != nil {
+		writeError(w, http.StatusInternalServerError, "label update stop failed: "+err.Error())
+		return
+	}
+	if _, err := manager.ContainerRemove(r.Context(), id, client.ContainerRemoveOptions{Force: true}); err != nil {
+		writeError(w, http.StatusInternalServerError, "label update remove failed: "+err.Error())
+		return
+	}
+
+	name := result.Container.Name
+	if strings.HasPrefix(name, "/") {
+		name = strings.TrimPrefix(name, "/")
+	}
+
+	opts := client.ContainerCreateOptions{
+		Image:      cfg.Image,
+		Config:     cfg,
+		HostConfig: result.Container.HostConfig,
+		Name:       name,
+	}
+
+	createResult, err := manager.ContainerCreate(r.Context(), opts)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "recreate failed: "+err.Error())
+		return
+	}
+
+	if _, err := manager.ContainerStart(r.Context(), createResult.ID, client.ContainerStartOptions{}); err != nil {
+		writeError(w, http.StatusInternalServerError, "start failed: "+err.Error())
+		return
+	}
 
 	writeJSON(w, http.StatusOK, APIResponse{
 		OK:      true,
-		Message: "labels updated (restart required to apply)",
-		Data:    existing,
+		Message: "labels updated and container recreated",
+		Data:    cfg.Labels,
 	})
 }
