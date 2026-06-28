@@ -443,9 +443,7 @@ func handleContainerSetLabels(w http.ResponseWriter, r *http.Request) {
 	}
 
 	name := result.Container.Name
-	if strings.HasPrefix(name, "/") {
-		name = strings.TrimPrefix(name, "/")
-	}
+	name = strings.TrimPrefix(name, "/")
 
 	opts := client.ContainerCreateOptions{
 		Image:      cfg.Image,
