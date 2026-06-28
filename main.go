@@ -15,8 +15,9 @@ import (
 
 var (
 	manager     ContainerManager
-	serverPort   = "8080"
-	stopTimeout  = 10
+	updater     Updater
+	serverPort  = "8080"
+	stopTimeout = 10
 )
 
 func init() {
@@ -37,6 +38,13 @@ func main() {
 		log.Fatalf("Failed to create container manager: %v", err)
 	}
 
+	// The updater (watchtower) is optional: if it can't be initialised we log
+	// and continue serving the rest of the API.
+	updater, err = NewUpdater()
+	if err != nil {
+		log.Printf("Warning: updater unavailable: %v", err)
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /containers", handleContainerCreate)
 	mux.HandleFunc("GET /containers", handleContainerList)
@@ -49,6 +57,8 @@ func main() {
 	mux.HandleFunc("POST /containers/{id}/rename", handleContainerRename)
 	mux.HandleFunc("GET /containers/{id}/labels", handleContainerGetLabels)
 	mux.HandleFunc("PUT /containers/{id}/labels", handleContainerSetLabels)
+	mux.HandleFunc("POST /containers/update", handleContainerUpdate)
+	mux.HandleFunc("POST /containers/check", handleContainerCheck)
 
 	log.Printf("Container agent listening on :%s\n", serverPort)
 	log.Fatal(http.ListenAndServe(":"+serverPort, mux))
@@ -268,7 +278,6 @@ func handleContainerReplace(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "start failed: "+err.Error())
 		return
 	}
-
 
 	writeJSON(w, http.StatusCreated, APIResponse{
 		OK:      true,

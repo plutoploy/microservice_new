@@ -33,12 +33,11 @@ func NewContainerManager() (ContainerManager, error) {
 	return &DockerManager{client: cli}, nil
 }
 
-func getClient() (*client.Client, error) {
-	if host := os.Getenv("DOCKER_HOST"); host != "" {
-		return client.NewClientWithOpts(client.WithHost(host), client.WithAPIVersionNegotiation())
-	}
-
-	rootlessPaths := make([]string, 0, 4)
+// candidateSocketPaths returns the ordered list of Docker/Podman socket paths
+// to fall back to ONLY when $DOCKER_HOST is not set. $DOCKER_HOST always takes
+// precedence and is never overridden by these.
+func candidateSocketPaths() []string {
+	rootlessPaths := make([]string, 0, 5)
 	if runtimeDir := os.Getenv("XDG_RUNTIME_DIR"); runtimeDir != "" {
 		rootlessPaths = append(rootlessPaths,
 			filepath.Join(runtimeDir, "podman/podman.sock"),
@@ -51,20 +50,52 @@ func getClient() (*client.Client, error) {
 			fmt.Sprintf("/run/user/%d/docker.sock", uid),
 		)
 	}
-	rootlessPaths = append(rootlessPaths, "/var/run/docker.sock")
+	return append(rootlessPaths, "/var/run/docker.sock")
+}
 
-	for _, path := range rootlessPaths {
+// Precedence:
+//  1. $DOCKER_HOST (authoritative; used verbatim, no socket probing)
+//  2. the first existing socket from candidateSocketPaths() (fallback only)
+
+func resolveDockerHost() (string, bool) {
+	if host := os.Getenv("DOCKER_HOST"); host != "" {
+		return host, true
+	}
+	for _, path := range candidateSocketPaths() {
 		if path == "" {
 			continue
 		}
 		if _, err := os.Stat(path); err == nil {
-			return client.NewClientWithOpts(
-				client.WithHost("unix://"+path),
-				client.WithAPIVersionNegotiation(),
-			)
+			return "unix://" + path, true
 		}
 	}
+	return "", false
+}
 
+func ensureDockerHost() error {
+	if os.Getenv("DOCKER_HOST") != "" {
+		return nil
+	}
+	if host, ok := resolveDockerHost(); ok {
+		return os.Setenv("DOCKER_HOST", host)
+	}
+	return nil
+}
+
+func getClient() (*client.Client, error) {
+	// $DOCKER_HOST is authoritative: defer entirely to client.FromEnv so the
+	// agent targets exactly what the environment specifies (no socket probing).
+	if os.Getenv("DOCKER_HOST") != "" {
+		return client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	}
+
+	// Otherwise fall back to a discovered socket.
+	if host, ok := resolveDockerHost(); ok {
+		return client.NewClientWithOpts(
+			client.WithHost(host),
+			client.WithAPIVersionNegotiation(),
+		)
+	}
 	return client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 }
 
@@ -83,7 +114,6 @@ func (m *DockerManager) ContainerStart(ctx context.Context, id string, opts clie
 func (m *DockerManager) ContainerList(ctx context.Context, opts client.ContainerListOptions) (client.ContainerListResult, error) {
 	return m.client.ContainerList(ctx, opts)
 }
-
 
 func (m *DockerManager) ContainerStop(ctx context.Context, id string, opts client.ContainerStopOptions) (client.ContainerStopResult, error) {
 	return m.client.ContainerStop(ctx, id, opts)

@@ -1,8 +1,6 @@
 [tools]
 go = "latest"
-clang = "latest"
 age = "latest"
-claude-code = "latest"
 gwvault = "latest"
 
 [settings]

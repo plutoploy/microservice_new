@@ -2,6 +2,10 @@
 
 Go agent for managing Docker containers via HTTP REST API.
 
+> **Full documentation:** see [`MANUAL.md`](MANUAL.md) for configuration,
+> endpoint resolution, the complete API reference, image-update details,
+> architecture, security notes, and troubleshooting.
+
 ## Build
 
 ```bash
@@ -15,24 +19,6 @@ go build -o container_agent .
 ```
 
 Listens on `:8080`. Requires Docker daemon access.
-
-## API
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/containers` | Create container |
-| `GET` | `/containers` | List containers (`?all=true`) |
-| `DELETE` | `/containers/{id}` | Teardown (stop + remove) |
-| `PUT` | `/containers/{id}` | Replace (stop + remove + create) |
-| `POST` | `/containers/{id}/start` | Start container |
-| `POST` | `/containers/{id}/stop` | Stop container |
-| `POST` | `/containers/{id}/restart` | Restart container |
-| `GET` | `/containers/{id}` | Inspect container |
-| `POST` | `/containers/{id}/rename` | Rename container |
-| `GET` | `/containers/{id}/labels` | Get labels |
-| `PUT` | `/containers/{id}/labels` | Update labels |
-
-## Examples
 
 **Create container:**
 ```bash
@@ -57,3 +43,25 @@ curl -X PUT http://localhost:8080/containers/my-app \
   -H "Content-Type: application/json" \
   -d '{"image":"nginx:1.25","labels":{"env":"prod"}}'
 ```
+
+**Check for image updates (no restart):**
+```bash
+curl -X POST http://localhost:8080/containers/check \
+  -H "Content-Type: application/json" \
+  -d '{"names":["my-app"]}'
+```
+
+**Update stale containers (pull newer image + recreate):**
+```bash
+# All containers; remove superseded images afterwards
+curl -X POST http://localhost:8080/containers/update \
+  -H "Content-Type: application/json" \
+  -d '{"cleanup":true}'
+```
+
+Update/check request fields (all optional): `names`, `disable_names`,
+`enable_label`, `scope`, `cleanup`, `no_restart`, `no_pull`,
+`timeout_seconds`, `monitor_only`. An empty body targets all containers.
+
+Image-update checks are powered by
+[`github.com/dockerutil/watchtower`](https://github.com/dockerutil/watchtower).
