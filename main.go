@@ -38,8 +38,6 @@ func main() {
 		log.Fatalf("Failed to create container manager: %v", err)
 	}
 
-	// The updater (watchtower) is optional: if it can't be initialised we log
-	// and continue serving the rest of the API.
 	updater, err = NewUpdater()
 	if err != nil {
 		log.Printf("Warning: updater unavailable: %v", err)
